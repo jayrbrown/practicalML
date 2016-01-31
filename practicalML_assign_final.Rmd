@@ -1,0 +1,160 @@
+---
+title: "PML Assignment"
+author: "Jay R Brown"
+date: "01/16/2016"
+output: html_document
+---
+
+## Introduction
+
+In this Practical Machine Learning Assignment we look at a weight lifting exercise dataset where measures were taken as subjects performed several different exercises. The goal is to predict how well the exercise was performed based on the data available. Each prediction is expressed as a letter grade where A is correct and B-E represent declining degrees of correctness.
+
+### Source
+- Source site: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset)
+- Training data: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+- Test data:     https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+```{r setup, echo=FALSE, warning=FALSE, error=FALSE, results='hide' }
+suppressMessages(library(dplyr)); suppressMessages(library(ggplot2)); 
+suppressMessages(library(caret)); suppressMessages(library(RANN));
+suppressMessages(library(randomForest)); suppressMessages(library(factoextra));
+```
+
+```{r loaddata, echo=FALSE, cache=TRUE}
+if (!file.exists("pml-training.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "pml-training.csv", cacheOK = TRUE)
+}
+
+pmlTrain <- read.table("pml-training.csv", sep=",", header=TRUE, stringsAsFactors=FALSE)
+# the classe field should be a factor
+pmlTrain$classe <- as.factor(pmlTrain$classe)
+
+# set measures to be numeric
+#for (i in 1:152) {
+for (i in 8:159) {
+  pmlTrain[,i] <- suppressWarnings(as.numeric(pmlTrain[,i]))
+}
+
+# split training dataset into training/test sets for cross-validation
+set.seed(2762)
+# split training data for cross validation
+trainPartition <- createDataPartition(y=pmlTrain$classe, p=0.75, list=FALSE)
+subTrain <- pmlTrain[trainPartition,]
+subTest <- pmlTrain[-trainPartition,]
+
+```
+
+## Data Exploration
+
+Starting with the supplied training data, we split it further for cross validation purposes where 75% is used for training and 25% for cross validation. All data exploration has been performed on the training subset of the supplied training data. We are working with 14,718 observations in our sub-training set with 4,904 observations set aside for cross validation.
+
+We examined plots of individual variables against the classe variable using the lattice package. There was a lack of distinction overall when comparing variables. It was most often the case where individual values could easily fall into multiple classe types. 
+
+Clearly there is no single variable or common variables suitable for prediction.
+
+### Dropped Variables
+* The first 5 variables are information about the observation like the row name, user performing the exercise and timestamps.
+* The num_window variable is an identifier, not a predictor, and the values would confuse the model.
+* The new_window variable indicates the start of a new time window in data collection. Exploring this reveals each of these rows has variables representing total, average, variance, and standard deviation for several observations. These aggregate values did not help the model evaluate individual observations. 
+  * A total of 44 aggregate variables were removed from the training subset.
+
+### Simple Row Aggregation
+
+Can we create a model which can analyze each row consistently without requiring a specialized approach? Using row level means and sums yields a notable lack of distinction among the five classe values. It was tried first in the interest of seeking the simplest solution possible. We also tried using just the variables common to all observations with the same lack of results.
+
+Using the row-wise approach, data for a correctly performed exercise (classe == A) tends to be of less variation than others thus making this simple method unsuitable. Note how the classe A values are more concentrated in the midst of the other classe values.
+
+```{r newWin, echo=FALSE, fig.width=4, fig.height=3}
+# thread about the window variable noting fields unique 
+#https://www.coursera.org/learn/practical-machine-learning/module/jTyf6/discussions/kLIKdL7qEeWjxw7W9fJX5Q
+
+subTrain <- select(subTrain, c(8:160))
+# remove aggregate variables
+agg <- grep("^avg_|stddev_|var_|total_", names(subTrain), value=TRUE)
+subTrain <- select(subTrain, -one_of(agg))
+
+pmlMeans <- rowMeans(subTrain[,-ncol(subTrain)], na.rm=TRUE)
+pmlSums <- rowSums(subTrain[,-ncol(subTrain)], na.rm=TRUE)
+
+# copy the df
+subTrain2 <- subTrain
+
+# add covariates
+subTrain2$avg <- rowMeans(subTrain2[,-ncol(subTrain)], na.rm=TRUE)
+subTrain2$sum <- rowSums(subTrain2[,-ncol(subTrain)], na.rm=TRUE)
+
+avgBox <- qplot(classe, avg, data=subTrain2, fill=classe, geom=c("jitter","boxplot"), main="Row Means")
+avgDen <- qplot(avg, data=subTrain2, colour=classe, geom="density", main="Row Means Density")
+
+par(mfrow=c(1,2))
+avgBox
+avgDen
+
+```
+
+
+## Classification Trees
+This is a two step classification problem where different groups of variables apply for different exercises. We must recognise these groups and use combinations of their respective values before we can predict if the exercise was done correctly (classe == A) or one of the four degrees of incorrectness (classe B:E) represented by the classe variable. 
+
+### Preprocessing
+Our goal at this stage is to determine which variables have the most impact in determination of the classe value. We've done this using a correlation approach in recognition of the need to leverage relationships among variables within groups.
+
+```{r correlation, echo=FALSE}
+# look for correlated variables
+corVars <- cor(subTrain[,-ncol(subTrain)]) 
+diag(corVars) <- 0
+corVarList <- row.names(which(corVars > 0.75, arr.ind=TRUE))
+
+# trim down the dataset
+shortTrain <- select(subTrain, c(one_of(corVarList), classe))
+
+```
+
+The variables showing the highest correlation values were selected for the training model. Higher correlation thresholds yielded too few variables for the model.
+
+* With 16 variables where correlation was > 0.8 our best model accuracy is 0.9676.
+* With 25 variables where correlation was > 0.75 our best model accuracy is 0.9855.
+* With 27 variables where correlation was > 0.7 our best model accuracy is 0.9853.
+
+We did not expect to see a better result with 2 fewer variables, but we will go with it and use a correlation cutoff of 0.75. 
+
+## Principle Components Analysis
+
+With our trimmed data we now look at the principal components analysis to verify we are able to account for all data using our selected variables. As we can see, the first 4 dimensions account for 90% of variance suggesting we have achieved good dimension reduction.
+
+```{r, echo=FALSE, fig.width=6, fig.height=4}
+
+# pca of short variable list
+shortPCA <- prcomp(~.,data=shortTrain[,-ncol(shortTrain)], center=TRUE, na.action=na.omit)
+
+fviz_screeplot(shortPCA, addlabels=TRUE) +
+  labs(title="PCA Variances") 
+
+```
+
+## Model Fitting
+
+With confidence in our feature selection, we can proceed with model fitting and test our predictions using our test subset we created for validation. A CART model was created, but with accuracy of ~ 43% it was discarded as useless.
+
+### Random Forest
+
+We achieved a much better result using the "rf" method in the train function from the caret package.
+
+```{r rf, echo=FALSE, cache=TRUE}
+# Random Forest Model
+modelFit <- train(classe ~ ., method="rf", data=shortTrain)
+testRF <- predict(modelFit, newdata=subTest)
+confusionMatrix(subTest$classe, testRF)
+```
+
+## Conclusion
+
+Our best model uses the RandomForest method via the Caret package with decent success as validated against our test subset. 
+
+The out of sample error is expected to increase with larger datasets. Given the variability found in data having 6 subjects and few exercises, the potential for scaling this prediction method is limited. The authors of the reference study drew a similar conclusion.
+
+The 20 most important variables in our model are listed below, most important at top.
+
+```{r}
+varImp(modelFit)
+```
